@@ -4,13 +4,14 @@ FB Auto Publisher — production web service (Flask + gunicorn) for Render.
 Public      GET  /health               liveness (always cheap)
 Protected   GET  /                     dashboard            (basic auth)
             GET  /status               JSON status + logs   (basic auth)
-            GET  /health?deep=1        API + FB token check (basic auth or RUN_KEY) -> 503 if degraded
-            POST /run                  start a run          (basic auth or RUN_KEY, header X-Run-Key or ?key=)
+            GET  /health?deep=1        API + FB token check (login or key) -> 503 if degraded
+            POST /run                  start a run          (login or ?key=PASSWORD, or header X-Run-Key)
 
 Per run
   1. fetch hotbuddy_fb + soulofmemori_fb, merge, de-dupe by id
-  2. sender 3997461173882085 -> schedule FB post, then POST {"id":X,"hotbuddy_fb":true}
-     sender 1482699040386498 -> POST {"id":X,"soulofmemori_fb":true}   (no FB post)
+  2. sender 3997461173882085 (hotbuddy)     -> schedule on HOT BADDY page,       then POST {"id":X,"hotbuddy_fb":true}
+     sender 1482699040386498 (soulofmemori) -> schedule on Soul of memories page, then POST {"id":X,"soulofmemori_fb":true}
+                                              (if SOULOFMEMORI_POST=False: only mark, no FB post)
 """
 import os
 import sys
@@ -28,76 +29,58 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from flask import Flask, jsonify, request, Response
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
 
+# ═══════════════════════ CONFIG — EDIT ONLY THIS BLOCK ═══════════════════════
+FB_HOTBUDDY_TOKEN     = "PASTE_HOTBUDDY_PAGE_TOKEN_HERE"      # ← token for page "HOT BADDY"
+FB_SOULOFMEMORI_TOKEN = "PASTE_SOULOFMEMORI_PAGE_TOKEN_HERE"  # ← token for page "Soul of memories"
+SOULOFMEMORI_POST     = True    # True = post to Soul of memories page too; False = only mark done (no FB post)
+PASSWORD          = "CHANGE_THIS_PASSWORD"                # ← dashboard login (user: admin) AND cron key
+DRY_RUN           = False                                 # True = test mode: logs only, no post, no mark
 
-# ═══════════════════════ CONFIG ═══════════════════════
-def _int(name, default):
-    try:
-        return int(os.environ.get(name, default))
-    except ValueError:
-        raise RuntimeError(f"Env var {name} must be an integer")
+# (optional) on Render you can set env vars FB_HOTBUDDY_TOKEN / PASSWORD instead of editing the file
+FB_HOTBUDDY_TOKEN     = os.environ.get("FB_HOTBUDDY_TOKEN", FB_HOTBUDDY_TOKEN)
+FB_SOULOFMEMORI_TOKEN = os.environ.get("FB_SOULOFMEMORI_TOKEN", FB_SOULOFMEMORI_TOKEN)
+PASSWORD          = os.environ.get("PASSWORD", PASSWORD)
 
+API_URL        = "https://shabbir.serv00.net/Fbtools/memoriesbangla/api.php"
+HOTBUDDY_PAGE_ID   = "1455823914281416"
+HOTBUDDY_PAGE_NAME = "HOT BADDY"
+SOULOFMEMORI_PAGE_ID   = "1359221437281984"
+SOULOFMEMORI_PAGE_NAME = "Soul of memories"
+DELAY_SEC      = 3600      # first post scheduled now + 1 hour (Facebook minimum 600)
+STAGGER_SEC    = 600       # gap between posts in one run
+MAX_ITEMS      = 20        # max items per run
+HTTP_TIMEOUT   = 30
+FB_API_VERSION = "v20.0"
+STATE_FILE     = "/tmp/posted_ids.json"
+LOG_LEVEL      = "INFO"
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _flag(name, default="0"):
-    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
-
-
-API_URL          = os.environ.get("API_URL", "https://shabbir.serv00.net/Fbtools/memoriesbangla/api.php")
-HTTP_TIMEOUT     = _int("HTTP_TIMEOUT", 30)
-FB_API_VERSION   = os.environ.get("FB_API_VERSION", "v20.0")
-GRAPH            = f"https://graph.facebook.com/{FB_API_VERSION}"
-
-RUN_KEY          = os.environ.get("RUN_KEY", "")
-DASH_USER        = os.environ.get("DASH_USER", "admin")
-DASH_PASSWORD    = os.environ.get("DASH_PASSWORD", "")
-
-ENABLE_SCHEDULER = _flag("ENABLE_SCHEDULER")
-RUN_EVERY_MIN    = max(1, _int("RUN_EVERY_MIN", 120))
-DELAY_SEC        = _int("SCHEDULE_DELAY_SEC", 3600)
-STAGGER_SEC      = _int("SCHEDULE_STAGGER_SEC", 600)
-MAX_ITEMS        = max(1, _int("MAX_ITEMS_PER_RUN", 20))
-DRY_RUN          = _flag("DRY_RUN")
-STATE_FILE       = os.environ.get("STATE_FILE", "/tmp/posted_ids.json")
-LOG_LEVEL        = os.environ.get("LOG_LEVEL", "INFO").upper()
-
+GRAPH      = f"https://graph.facebook.com/{FB_API_VERSION}"
+DASH_USER  = "admin"
+RUN_KEY    = PASSWORD
 CATEGORIES = ["hotbuddy_fb", "soulofmemori_fb"]
 FB_PAGES = {
-    "hotbuddy_fb": {
-        "name":    os.environ.get("FB_HOTBUDDY_PAGE_NAME", "HOT BADDY"),
-        "page_id": os.environ.get("FB_HOTBUDDY_PAGE_ID", "1455823914281416"),
-        "token":   os.environ.get("FB_HOTBUDDY_TOKEN", ""),
-    },
-    "soulofmemori_fb": {
-        "name":    "Soul of memories",
-        "page_id": os.environ.get("FB_SOULOFMEMORI_PAGE_ID", "1359221437281984"),
-        "token":   os.environ.get("FB_SOULOFMEMORI_TOKEN", ""),
-    },
+    "hotbuddy_fb":     {"name": HOTBUDDY_PAGE_NAME,     "page_id": HOTBUDDY_PAGE_ID,     "token": FB_HOTBUDDY_TOKEN},
+    "soulofmemori_fb": {"name": SOULOFMEMORI_PAGE_NAME, "page_id": SOULOFMEMORI_PAGE_ID, "token": FB_SOULOFMEMORI_TOKEN},
 }
-MARK_ONLY_SENDERS    = {"1482699040386498"}
-UPLOAD_SENDERS       = {"3997461173882085"}
-MARK_FIELD_BY_SENDER = {"1482699040386498": "soulofmemori_fb", "3997461173882085": "hotbuddy_fb"}
-SENDER_TO_CATEGORY   = {"3997461173882085": "hotbuddy_fb"}
+HOTBUDDY_SENDER, SOULOFMEMORI_SENDER = "3997461173882085", "1482699040386498"
+MARK_FIELD_BY_SENDER = {SOULOFMEMORI_SENDER: "soulofmemori_fb", HOTBUDDY_SENDER: "hotbuddy_fb"}
+SENDER_TO_CATEGORY   = {SOULOFMEMORI_SENDER: "soulofmemori_fb", HOTBUDDY_SENDER: "hotbuddy_fb"}
+UPLOAD_SENDERS       = {HOTBUDDY_SENDER} | ({SOULOFMEMORI_SENDER} if SOULOFMEMORI_POST else set())
+MARK_ONLY_SENDERS    = set() if SOULOFMEMORI_POST else {SOULOFMEMORI_SENDER}
 FOLLOW_TEMPLATE      = "\n\nFollow my page: @{page_name}"
 
-# ── fail fast on bad config ──
-_missing = [k for k, v in (("FB_HOTBUDDY_TOKEN", FB_PAGES["hotbuddy_fb"]["token"]),
-                           ("RUN_KEY", RUN_KEY), ("DASH_PASSWORD", DASH_PASSWORD)) if not v]
-if _missing and not os.environ.get("ALLOW_MISSING_ENV"):
-    raise RuntimeError("Missing required env vars: " + ", ".join(_missing))
-if DELAY_SEC < 600:
-    raise RuntimeError("SCHEDULE_DELAY_SEC must be >= 600 (Facebook minimum is 10 minutes)")
-if len(RUN_KEY) < 16 and RUN_KEY:
-    raise RuntimeError("RUN_KEY should be at least 16 characters")
+if "PASTE_" in FB_HOTBUDDY_TOKEN or PASSWORD == "CHANGE_THIS_PASSWORD":
+    raise RuntimeError("Edit the CONFIG block at the top of app.py: set FB_HOTBUDDY_TOKEN and PASSWORD")
+if SOULOFMEMORI_POST and "PASTE_" in FB_SOULOFMEMORI_TOKEN:
+    raise RuntimeError("Set FB_SOULOFMEMORI_TOKEN, or set SOULOFMEMORI_POST = False")
+if len(PASSWORD) < 8:
+    raise RuntimeError("PASSWORD must be at least 8 characters")
 
 
 # ═══════════════════════ LOGGING (secrets redacted) ═══════════════════════
-SECRETS = [s for s in (RUN_KEY, DASH_PASSWORD, FB_PAGES["hotbuddy_fb"]["token"],
-                       FB_PAGES["soulofmemori_fb"]["token"]) if s]
+SECRETS = [s for s in (PASSWORD, FB_HOTBUDDY_TOKEN, FB_SOULOFMEMORI_TOKEN) if s]
 LOGS = collections.deque(maxlen=500)
 logging.basicConfig(stream=sys.stdout, level=getattr(logging, LOG_LEVEL, logging.INFO),
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -374,18 +357,6 @@ def run_once(trigger: str) -> None:
         RUN_LOCK.release()
 
 
-def scheduler_loop():
-    time.sleep(20)
-    while True:
-        run_once("scheduler")
-        time.sleep(RUN_EVERY_MIN * 60)
-
-
-if ENABLE_SCHEDULER:
-    threading.Thread(target=scheduler_loop, daemon=True, name="scheduler").start()
-    log(f"built-in scheduler on: every {RUN_EVERY_MIN} min")
-
-
 # ═══════════════════════ AUTH + HEADERS ═══════════════════════
 def _eq(a: str, b: str) -> bool:
     return hmac.compare_digest((a or "").encode(), (b or "").encode())
@@ -393,7 +364,7 @@ def _eq(a: str, b: str) -> bool:
 
 def basic_ok() -> bool:
     a = request.authorization
-    return bool(a and a.username is not None and _eq(a.username, DASH_USER) and _eq(a.password, DASH_PASSWORD))
+    return bool(a and a.username is not None and _eq(a.username, DASH_USER) and _eq(a.password, PASSWORD))
 
 
 def key_ok() -> bool:
@@ -441,7 +412,6 @@ def health():
             deep[cat] = f"error: {e}"
     bad = [k for k, v in deep.items() if not (str(v).startswith("ok") or "skipped" in str(v))]
     out.update(deep=deep, last_run=LAST_RUN, dry_run=DRY_RUN,
-               scheduler={"enabled": ENABLE_SCHEDULER, "every_min": RUN_EVERY_MIN},
                status="degraded" if bad else "ok")
     return jsonify(_json_safe(out)), (503 if bad else 200)
 
@@ -511,4 +481,4 @@ def dashboard():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=_int("PORT", 10000))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
